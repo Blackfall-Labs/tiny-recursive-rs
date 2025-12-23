@@ -4,7 +4,7 @@ use candle_nn::{VarMap, VarBuilder, AdamW, ParamsAdamW, Optimizer, loss, ops};
 use std::path::Path;
 
 use crate::{TinyRecursiveModel, TRMConfig};
-use crate::data::BatchDataLoader;
+use crate::data::{DataLoader, BatchDataLoader};
 use crate::models::InnerCarry;
 use super::scheduler::CosineScheduler;
 use super::ema::{EMA, EMAConfig};
@@ -78,9 +78,10 @@ impl Trainer {
         training_config: TrainingConfig,
         device: Device,
     ) -> Result<Self> {
-        // Create model with F64 to avoid dtype issues
+        // Create model with F16 for speed (GPU has dedicated F16 cores)
+        let dtype = if device.is_cuda() { DType::F16 } else { DType::F32 };
         let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F64, &device);
+        let vb = VarBuilder::from_varmap(&varmap, dtype, &device);
         let model = TinyRecursiveModel::new(model_config.clone(), vb)
             .map_err(|e| candle_core::Error::Msg(format!("Model init failed: {:?}", e)))?;
 
@@ -102,11 +103,8 @@ impl Trainer {
             total_steps: training_config.total_steps,
         });
 
-        // Create EMA
-        let ema_config = EMAConfig {
-            decay: training_config.ema_decay,
-        };
-        let ema = Some(EMA::new(ema_config));
+        // EMA disabled for training speed
+        let ema = None;
 
         Ok(Self {
             model,
@@ -149,37 +147,39 @@ impl Trainer {
             // Flatten targets to [batch]
             let targets_flat = targets.flatten_all()?;
 
-            // Compute log_softmax
-            let log_probs = ops::log_softmax(&logits_pooled, candle_core::D::Minus1)?;
+            // Compute log_softmax and convert to F32 for loss computation
+            let log_probs = ops::log_softmax(&logits_pooled, candle_core::D::Minus1)?
+                .to_dtype(DType::F32)?;
 
             // Gather log probs at target indices and compute negative log likelihood
-            let mut loss_sum = 0.0f64;
+            let mut loss_sum = 0.0f32;
             for i in 0..batch_size {
                 let target_idx = targets_flat.get(i)?.to_scalar::<u32>()? as usize;
-                let log_prob = log_probs.get(i)?.get(target_idx)?.to_scalar::<f64>()?;
+                let log_prob = log_probs.get(i)?.get(target_idx)?.to_scalar::<f32>()?;
                 loss_sum -= log_prob;
             }
 
-            let loss_val = loss_sum / batch_size as f64;
-            Tensor::from_slice(&[loss_val], 1, &self.device)?.to_dtype(DType::F64)?.squeeze(0)
+            let loss_val = loss_sum / batch_size as f32;
+            Tensor::from_slice(&[loss_val], 1, &self.device)?.squeeze(0)
         } else {
             // Sequence modeling task: targets shape [batch, seq_len]
             let logits_flat = logits.reshape((batch_size * seq_len, num_classes))?;
             let targets_flat = targets.flatten_all()?;
 
-            // Compute log_softmax
-            let log_probs = ops::log_softmax(&logits_flat, candle_core::D::Minus1)?;
+            // Compute log_softmax and convert to F32 for loss computation
+            let log_probs = ops::log_softmax(&logits_flat, candle_core::D::Minus1)?
+                .to_dtype(DType::F32)?;
 
             // Gather log probs at target indices
-            let mut loss_sum = 0.0f64;
+            let mut loss_sum = 0.0f32;
             for i in 0..(batch_size * seq_len) {
                 let target_idx = targets_flat.get(i)?.to_scalar::<u32>()? as usize;
-                let log_prob = log_probs.get(i)?.get(target_idx)?.to_scalar::<f64>()?;
+                let log_prob = log_probs.get(i)?.get(target_idx)?.to_scalar::<f32>()?;
                 loss_sum -= log_prob;
             }
 
-            let loss_val = loss_sum / (batch_size * seq_len) as f64;
-            Tensor::from_slice(&[loss_val], 1, &self.device)?.to_dtype(DType::F64)?.squeeze(0)
+            let loss_val = loss_sum / (batch_size * seq_len) as f32;
+            Tensor::from_slice(&[loss_val], 1, &self.device)?.squeeze(0)
         }
     }
 
@@ -195,12 +195,13 @@ impl Trainer {
 
         log::debug!("Input dtype: {:?}, Target dtype: {:?}", input_ids.dtype(), target_ids.dtype());
 
-        // Create initial carry with F64
+        // Create initial carry with correct dtype (F16 on GPU, F32 on CPU)
+        let dtype = if self.device.is_cuda() { DType::F16 } else { DType::F32 };
         let carry = InnerCarry::empty(
             batch_size,
             seq_len,
             self.model_config.hidden_size,
-            DType::F64,
+            dtype,
             &self.device,
         )?;
 
@@ -215,7 +216,7 @@ impl Trainer {
         log::debug!("Computing loss...");
         let loss = self.compute_loss(&logits, target_ids)
             .map_err(|e| candle_core::Error::Msg(format!("Loss computation failed: {:?}", e)))?;
-        let loss_val = loss.to_scalar::<f64>()? as f32;
+        let loss_val = loss.to_scalar::<f32>()?;
 
         // Update learning rate before optimizer step
         let lr = self.scheduler.get_lr();
@@ -228,12 +229,7 @@ impl Trainer {
         // Scheduler step
         self.scheduler.step();
 
-        // EMA update
-        if let Some(ref mut ema) = self.ema {
-            let vars = self.varmap.all_vars();
-            let params: Vec<Tensor> = vars.iter().map(|v| v.as_tensor().clone()).collect();
-            ema.update(&params)?;
-        }
+        // EMA disabled for speed
 
         self.step += 1;
 
@@ -242,11 +238,13 @@ impl Trainer {
 
     /// Save checkpoint
     pub fn save_checkpoint<P: AsRef<Path>>(&self, path: P, loss: Option<f64>) -> Result<()> {
-        use std::collections::HashMap;
-
         std::fs::create_dir_all(&self.config.checkpoint_dir)
             .map_err(|e| candle_core::Error::Msg(format!("Failed to create checkpoint dir: {}", e)))?;
 
+        // Save weights using varmap.save() - this actually saves the tensors
+        self.varmap.save(path.as_ref())?;
+
+        // Save metadata separately as JSON sidecar
         let metadata = CheckpointMetadata {
             step: self.step,
             lr: self.scheduler.get_lr(),
@@ -254,16 +252,15 @@ impl Trainer {
             config: None,
         };
 
-        // Extract tensors from varmap
-        let mut tensors = HashMap::new();
-        for (name, var) in self.varmap.data().lock().unwrap().iter() {
-            tensors.insert(name.clone(), var.as_tensor().clone());
-        }
+        let metadata_path = format!("{}.meta.json", path.as_ref().display());
+        let metadata_json = serde_json::to_string_pretty(&metadata)
+            .map_err(|e| candle_core::Error::Msg(format!("Metadata serialization failed: {}", e)))?;
+        std::fs::write(&metadata_path, metadata_json)
+            .map_err(|e| candle_core::Error::Msg(format!("Metadata write failed: {}", e)))?;
 
-        let checkpoint = Checkpoint::new(tensors, metadata);
+        log::debug!("Saved checkpoint weights to {} and metadata to {}", path.as_ref().display(), metadata_path);
 
-        checkpoint.save(path.as_ref())
-            .map_err(|e| candle_core::Error::Msg(format!("Failed to save checkpoint: {}", e)))
+        Ok(())
     }
 
     /// Train for one epoch
@@ -273,15 +270,12 @@ impl Trainer {
 
         dataloader.reset();
 
-        println!("Starting epoch loop...");
         while let Some((input_ids, target_ids)) = dataloader.next_batch(&self.device)? {
-            println!("Processing batch {}...", num_batches + 1);
             let loss = self.train_step(&input_ids, &target_ids)?;
             total_loss += loss;
             num_batches += 1;
 
-            println!("Batch {} complete, loss: {:.4}", num_batches, loss);
-
+            // Log every 100 batches instead of every batch for speed
             if self.step % 100 == 0 {
                 log::info!(
                     "Step {}: loss={:.4}, lr={:.6}",

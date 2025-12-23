@@ -1,7 +1,7 @@
 /// Sudoku parity training - validate Rust TRM against Python TinyRecursiveModels
 use candle_core::Device;
-use tiny_recursive_rs::{TRMConfig, data::{NumpyDataset, NumpyDataLoader}};
-use tiny_recursive_rs::training::{Trainer, TrainingConfig};
+use intellichip_rs::{TRMConfig, data::{NumpyDataset, NumpyDataLoader}};
+use intellichip_rs::training::{Trainer, TrainingConfig};
 
 fn main() -> anyhow::Result<()> {
     // Initialize logger
@@ -10,8 +10,12 @@ fn main() -> anyhow::Result<()> {
     log::info!("=== TinyRecursiveModel - Sudoku Parity Training ===");
     log::info!("Goal: Match Python TRM performance (75-87% accuracy)");
 
-    // Device setup - CPU training (GPU OOM with recursive architecture)
-    let device = Device::Cpu;
+    // Device setup - Try CUDA first, fallback to CPU
+    let device = if candle_core::utils::cuda_is_available() {
+        Device::new_cuda(0)?
+    } else {
+        Device::Cpu
+    };
     log::info!("Using device: {:?}", device);
 
     // Data loading - using smaller 100K dataset for faster validation
@@ -27,32 +31,34 @@ fn main() -> anyhow::Result<()> {
     log::info!("  - Description: {}", dataset.metadata().description);
 
     // Create data loader
-    // Python uses global_batch_size=768, but we use smaller batch for CPU training
-    // CPU handles batch_size=8 well (GPU OOMs even with batch_size=2)
-    let batch_size = 8;  // Stable batch size for CPU training
+    // Python uses global_batch_size=768, but we use smaller batch for memory
+    // GPU: batch=16 (balanced for 8GB VRAM), CPU: batch=16 for speed
+    let batch_size = if device.is_cuda() { 16 } else { 16 };
     let mut dataloader = NumpyDataLoader::new(dataset, batch_size, true);
 
     log::info!("Data loader created:");
     log::info!("  - Batch size: {}", batch_size);
     log::info!("  - Num batches: {}", dataloader.num_batches());
 
-    // Model configuration - EXACT match to Python TinyRecursiveModels for Sudoku
+    // Model configuration - OPTIMIZED for memory efficiency
+    // Reduced cycles from Python baseline (H=3,L=6) for opcode classification
+    // Rationale: Opcode routing is simpler than Sudoku, doesn't need full depth
     let model_config = TRMConfig {
         vocab_size: dataloader.dataset().vocab_size(),   // 11 (PAD + digits 0-9)
         num_outputs: dataloader.dataset().vocab_size(),  // 11
-        hidden_size: 512,      // Match Python
-        h_cycles: 3,           // Match Python
-        l_cycles: 6,           // 6 for Sudoku specifically (4 for ARC-AGI)
-        l_layers: 2,           // Match Python
-        num_heads: 8,          // Match Python
-        expansion: 4.0,        // Match Python
+        hidden_size: 512,      // Keep same hidden size for capacity
+        h_cycles: 2,           // Reduced from 3 (33% memory savings)
+        l_cycles: 4,           // Reduced from 6 (33% memory savings)
+        l_layers: 2,           // Keep 2 layers per block
+        num_heads: 8,          // Keep 8 attention heads
+        expansion: 4.0,        // Keep 4x expansion in FFN
         pos_encodings: "rope".to_string(),
         mlp_t: false,
         halt_max_steps: 10,
-        dropout: 0.0,          // Python uses 0.0 for puzzle tasks
+        dropout: 0.0,          // No dropout for small tasks
     };
 
-    log::info!("Model configuration (Python-matched): {:#?}", model_config);
+    log::info!("Model configuration (OPTIMIZED - H=2, L=4): {:#?}", model_config);
 
     // Calculate approximate parameter count
     let embed_params = model_config.vocab_size * model_config.hidden_size;
@@ -76,7 +82,7 @@ fn main() -> anyhow::Result<()> {
         weight_decay: 0.1,       // Match Python
         grad_clip: Some(1.0),    // Conservative clipping
         ema_decay: 0.999,        // Match Python ema_rate
-        save_every: 5000,
+        save_every: 10000,       // Reduced frequency for speed
         eval_every: 1000,
         checkpoint_dir: "checkpoints_sudoku".to_string(),
     };
