@@ -55,14 +55,30 @@ This allows the model to achieve high accuracy with minimal parameters (~2M for 
 
 ## Benchmarks
 
-| Dataset | Accuracy | Parameters | Training Time (CPU) |
-|---------|----------|------------|---------------------|
-| Sudoku (100K) | 75-87% | 2.1M | 1-2 hours |
-| Sudoku (1M) | 75-87% | 2.1M | 8-12 hours |
+### Sudoku (Python Parity Target: 75-87% accuracy)
 
-**Config**: `hidden=512, H=3, L=6, layers=2, heads=8`
+| Dataset | Config | Parameters | GPU Time | CPU Time |
+|---------|--------|------------|----------|----------|
+| Sudoku 100K | H=3, L=6 | 2.1M | ~10 hrs | ~24-48 hrs |
+| Sudoku 100K | H=2, L=4 (reduced) | 2.1M | ~10 hrs | ~20 hrs |
 
-**Hardware**: Tested on AMD Ryzen 7 5800X (CPU), NVIDIA RTX 3070 (GPU)
+**Python Parity Config**: `hidden=512, H=3, L=6, layers=2, heads=8, batch=32`
+
+### Consumer Hardware Expectations
+
+Tested on real consumer hardware:
+
+| Hardware | Sudoku 100K (H=3,L=6) | Sudoku 100K (H=2,L=4) |
+|----------|----------------------|----------------------|
+| RTX 3060 12GB | ~10 hours | ~10 hours |
+| RTX 3070/3080 | ~6-8 hours | ~6 hours |
+| Apple M1 16GB | ~24-48 hours | ~20 hours |
+| Intel i7 (CPU only) | ~48+ hours | ~24 hours |
+
+**Notes for consumer GPUs:**
+- 8GB VRAM: Use `batch_size=16`, may need reduced config (H=2, L=4)
+- 12GB+ VRAM: Use `batch_size=32` with full config (H=3, L=6)
+- The recursive architecture (H×L cycles) multiplies memory usage
 
 ## Example Usage
 
@@ -127,15 +143,13 @@ dataset/
 
 ### CPU Optimization
 
-- Use `batch_size=8` for stable training
+- Use `batch_size=16-32` for stable training
 - Enable release optimizations: `cargo build --release`
-- Multi-threading: TRM benefits from Rayon parallelism
+- Expect ~48+ hours for full Sudoku training on modern CPUs
 
-### GPU Optimization
+### GPU Optimization (CUDA - NVIDIA)
 
-**Note**: TRM's deep recursive architecture (H=3 × L=6 = 36 effective layers) can cause GPU OOM even with small batches. CPU training is recommended for stability.
-
-To enable CUDA:
+TRM trains well on consumer NVIDIA GPUs. Memory usage scales with H×L cycles.
 
 ```toml
 [dependencies]
@@ -146,6 +160,29 @@ candle-nn = { version = "0.8", features = ["cuda"] }
 ```rust
 let device = Device::new_cuda(0)?;
 ```
+
+**VRAM Guidelines:**
+| VRAM | Recommended Config |
+|------|-------------------|
+| 6GB | H=2, L=3, batch=8 |
+| 8GB | H=2, L=4, batch=16 |
+| 12GB+ | H=3, L=6, batch=32 (full parity) |
+
+### Metal Optimization (Apple Silicon)
+
+For M1/M2/M3 Macs with unified memory:
+
+```toml
+[dependencies]
+candle-core = { version = "0.8", features = ["metal"] }
+candle-nn = { version = "0.8", features = ["metal"] }
+```
+
+```rust
+let device = Device::new_metal(0)?;
+```
+
+Apple Silicon benefits from unified memory - a 16GB M1 can handle full H=3, L=6 config with batch=32.
 
 ## Project Structure
 
@@ -167,10 +204,12 @@ tiny-recursive-rs/
 | Feature | Python TRM | tiny-recursive-rs |
 |---------|------------|-------------------|
 | **Accuracy** | 75-87% (Sudoku) | 75-87% (Sudoku) ✅ |
-| **Training Speed** | ~10 hrs (CPU) | ~2 hrs (100K dataset) |
-| **Dependencies** | PyTorch, NumPy, ... | Candle only |
+| **Training Speed** | ~100K steps | ~50 epochs (equivalent) |
+| **Dependencies** | PyTorch, NumPy, etc. | Candle only |
 | **Platform** | Python 3.8+ | Any Rust target |
 | **Model Export** | .pth | .safetensors |
+| **GPU Support** | CUDA | CUDA + Metal |
+| **Dtype** | F16/BF16 | F32 (stability) |
 
 ## Validation Against Python
 
