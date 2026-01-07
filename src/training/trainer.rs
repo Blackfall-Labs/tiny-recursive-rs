@@ -4,7 +4,7 @@ use candle_nn::{VarMap, VarBuilder, AdamW, ParamsAdamW, Optimizer, loss, ops};
 use std::path::Path;
 
 use crate::{TinyRecursiveModel, TRMConfig};
-use crate::data::{DataLoader, BatchDataLoader};
+use crate::data::{NumpyDataLoader, BatchDataLoader};
 use crate::models::InnerCarry;
 use super::scheduler::CosineScheduler;
 use super::ema::{EMA, EMAConfig};
