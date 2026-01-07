@@ -2,7 +2,7 @@
 name = "tiny-recursive-rs"
 version = "0.1.0"
 edition = "2021"
-authors = ["Blackfall Labs <opensource@blackfall.io>"]
+authors = ["Blackfall Labs"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/blackfall-labs/tiny-recursive-rs"
 homepage = "https://github.com/blackfall-labs/tiny-recursive-rs"
